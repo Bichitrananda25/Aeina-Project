@@ -1,0 +1,300 @@
+import cv2
+import mediapipe as mp
+import os
+import numpy as np 
+import time
+import math 
+
+# Initialize MediaPipe solutions
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose()
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+# Load video feed
+cap = cv2.VideoCapture(0)
+
+# Load shirt images
+shirt_folder = r"C:\Users\Asus\OneDrive\Desktop\ShirtTryOn\Resources\Shirts"
+shirt_list = [os.path.join(shirt_folder, img) for img in os.listdir(shirt_folder) if img.endswith(('.png', '.jpg'))]
+shirt_index = 0
+
+# Load face filter images
+filter_folder = r"C:\Users\Asus\OneDrive\Desktop\ShirtTryOn\Resources\Filters"
+filter_list = [os.path.join(filter_folder, img) for img in os.listdir(filter_folder) if img.endswith(('.png', '.jpg'))]
+filter_index = 0
+
+# Perfect distance range (for frame color change)
+min_perfect_distance = 0.18  
+max_perfect_distance = 0.24  
+
+# Time tracker for changing items
+last_change_time = time.time()
+
+# State variables
+show_size = False
+show_shirt = False
+size_display_time = 0
+size_display_duration = 3  # seconds
+
+def overlay_transparent(background, overlay, x, y):
+    if overlay is None or background is None:
+        return background
+
+    h, w = overlay.shape[:2]
+    if len(overlay.shape) == 2:
+        overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+    
+    if overlay.shape[2] == 4:
+        overlay_rgb = overlay[:, :, :3]
+        mask = overlay[:, :, 3] / 255.0
+    else:
+        overlay_rgb = overlay
+        mask = np.ones((h, w))
+
+    y_end = min(background.shape[0], y + h)
+    x_end = min(background.shape[1], x + w)
+    y = max(0, y)
+    x = max(0, x)
+
+    if y >= y_end or x >= x_end:
+        return background
+
+    overlay_height = y_end - y
+    overlay_width = x_end - x
+    overlay_rgb = cv2.resize(overlay_rgb, (overlay_width, overlay_height))
+    
+    if len(mask.shape) == 3:
+        mask = cv2.resize(mask[:, :, 0], (overlay_width, overlay_height))
+    else:
+        mask = cv2.resize(mask, (overlay_width, overlay_height))
+    
+    mask = np.expand_dims(mask, axis=-1)
+    
+    try:
+        background[y:y_end, x:x_end] = (1.0 - mask) * background[y:y_end, x:x_end] + mask * overlay_rgb
+    except ValueError as e:
+        print(f"Error in overlay: {str(e)}")
+        return background
+
+    return background
+
+def draw_body_border(frame, landmarks, frame_color, thickness=4):
+    if not landmarks:
+        return frame
+    
+    # Create a black mask
+    mask = np.zeros_like(frame)
+    
+    # Get all body points
+    body_points = []
+    for landmark in landmarks:
+        x = int(landmark.x * frame.shape[1])
+        y = int(landmark.y * frame.shape[0])
+        body_points.append((x, y))
+    
+    # Convert to numpy array
+    body_points = np.array(body_points)
+    
+    # Get the convex hull of the body points
+    hull = cv2.convexHull(body_points)
+    
+    # Draw dotted lines for the convex hull
+    for i in range(len(hull)):
+        # Get current and next point
+        pt1 = tuple(hull[i][0])
+        pt2 = tuple(hull[(i + 1) % len(hull)][0])
+        
+        # Calculate distance between points
+        distance = np.sqrt((pt2[0] - pt1[0])*2 + (pt2[1] - pt1[1])*2)
+        
+        # Number of dots to draw
+        num_dots = int(distance / 10)  # Adjust 10 to change dot spacing
+        
+        if num_dots > 0:
+            # Calculate step size
+            step_x = (pt2[0] - pt1[0]) / num_dots
+            step_y = (pt2[1] - pt1[1]) / num_dots
+            
+            # Draw dots
+            for j in range(num_dots):
+                dot_x = int(pt1[0] + j * step_x)
+                dot_y = int(pt1[1] + j * step_y)
+                cv2.circle(mask, (dot_x, dot_y), thickness, frame_color, -1)
+    
+    # Add some padding around the body
+    kernel = np.ones((thickness*2, thickness*2), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    
+    # Blend the mask with the frame
+    alpha = 0.3  # Transparency factor
+    frame = cv2.addWeighted(frame, 1, mask, alpha, 0)
+    
+    return frame
+
+# Process video frames
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
+        break
+
+    # Flip the frame horizontally for a later selfie-view display
+    frame = cv2.flip(frame, 1)
+    
+    # Convert the BGR image to RGB
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    # Process Face Mesh
+    face_results = face_mesh.process(rgb_frame)
+    
+    # Process Pose
+    pose_results = pose.process(rgb_frame)
+    
+    # Process Hands
+    hand_results = hands.process(rgb_frame)
+
+    # Initialize variables
+    body_size = "Unknown"
+    frame_color = (0, 0, 255)  # Default: Red (Too Close/Far)
+
+    # Face mesh processing
+    if face_results.multi_face_landmarks:
+        for face_landmarks in face_results.multi_face_landmarks:
+            # Get face bounding box
+            face_points = np.array([(lm.x * frame.shape[1], lm.y * frame.shape[0]) 
+                                  for lm in face_landmarks.landmark])
+            
+            x_min, y_min = np.min(face_points, axis=0).astype(int)
+            x_max, y_max = np.max(face_points, axis=0).astype(int)
+            
+            face_width = x_max - x_min
+            face_height = y_max - y_min
+            
+            # Load and overlay filter
+            if filter_list:
+                filter_img = cv2.imread(filter_list[filter_index], cv2.IMREAD_UNCHANGED)
+                if filter_img is not None:
+                    # Resize filter to match face size
+                    filter_resized = cv2.resize(filter_img, (face_width, face_height))
+                    frame = overlay_transparent(frame, filter_resized, x_min, y_min)
+
+    # Pose processing for body border and shirt
+    if pose_results.pose_landmarks:
+        landmarks = pose_results.pose_landmarks.landmark
+        
+        # Get shoulder coordinates
+        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
+
+        # Convert to pixel coordinates
+        shoulder_x1 = int(left_shoulder.x * frame.shape[1])
+        shoulder_x2 = int(right_shoulder.x * frame.shape[1])
+        shoulder_y = int((left_shoulder.y + right_shoulder.y) / 2 * frame.shape[0])
+        hip_y = int((left_hip.y + right_hip.y) / 2 * frame.shape[0])
+
+        # Calculate measurements
+        frame_width = frame.shape[1]
+        shoulder_width = abs(shoulder_x2 - shoulder_x1)
+
+        # Determine body size
+        if shoulder_width < frame_width * 0.15:
+            body_size = "S"
+        elif frame_width * 0.15 <= shoulder_width < frame_width * 0.22:
+            body_size = "M"
+        elif frame_width * 0.22 <= shoulder_width < frame_width * 0.28:
+            body_size = "L"
+        elif frame_width * 0.28 <= shoulder_width < frame_width * 0.34:
+            body_size = "XL"
+        elif frame_width * 0.34 <= shoulder_width < frame_width * 0.40:
+            body_size = "XXL"
+        else:
+            body_size = "XXXL"
+
+        # Distance feedback
+        shoulder_norm = abs(left_shoulder.x - right_shoulder.x)
+        if min_perfect_distance <= shoulder_norm <= max_perfect_distance:
+            frame_color = (0, 255, 0)  # Green for perfect distance
+            if not show_size:
+                show_size = True
+                size_display_time = time.time()
+
+        # Draw body border
+        frame = draw_body_border(frame, landmarks, frame_color)
+
+        # Show size after perfect distance is achieved
+        if show_size and not show_shirt:
+            if time.time() - size_display_time < size_display_duration:
+                # Display size in center of screen
+                text = f"Your Size: {body_size}"
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2, 3)[0]
+                text_x = (frame.shape[1] - text_size[0]) // 2
+                text_y = (frame.shape[0] + text_size[1]) // 2
+                cv2.putText(frame, text, (text_x, text_y), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3, cv2.LINE_AA)
+            else:
+                show_shirt = True
+
+        # Show shirt after size display
+        if show_shirt and shirt_list:
+            shirt_width = shoulder_width + 50
+            shirt_height = abs(hip_y - shoulder_y) + 80
+            shirt_x = (shoulder_x1 + shoulder_x2) // 2 - (shirt_width // 2)
+            shirt_y = shoulder_y - 20
+
+            shirt = cv2.imread(shirt_list[shirt_index], cv2.IMREAD_UNCHANGED)
+            if shirt is not None:
+                shirt_resized = cv2.resize(shirt, (shirt_width, shirt_height))
+                frame = overlay_transparent(frame, shirt_resized, shirt_x, shirt_y)
+
+    # Hand gesture processing
+    if hand_results.multi_hand_landmarks:
+        for hand_landmarks in hand_results.multi_hand_landmarks:
+            # Get finger coordinates
+            index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            
+            # Convert to pixel coordinates
+            index_x = int(index_tip.x * frame.shape[1])
+            index_y = int(index_tip.y * frame.shape[0])
+            thumb_x = int(thumb_tip.x * frame.shape[1])
+            thumb_y = int(thumb_tip.y * frame.shape[0])
+            
+            # Calculate pinch distance
+            pinch_distance = math.sqrt((index_x - thumb_x) ** 2 + (index_y - thumb_y) ** 2)
+            
+            # Change item on pinch
+            if pinch_distance < 40 and (time.time() - last_change_time) > 1:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('f'):
+                    if filter_list:
+                        filter_index = (filter_index + 1) % len(filter_list)
+                else:
+                    if shirt_list:
+                        shirt_index = (shirt_index + 1) % len(shirt_list)
+                last_change_time = time.time()
+
+    # Display instructions
+    if not show_size:
+        cv2.putText(frame, "Move to perfect distance to see your size", 
+                    (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3, cv2.LINE_AA)
+    elif show_size and not show_shirt:
+        cv2.putText(frame, "Your size will be shown for 3 seconds", 
+                    (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, "Pinch to change dress!", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(frame, "Press 'f' + pinch to change filter", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3, cv2.LINE_AA)
+
+    # Show frame
+    cv2.imshow("Virtual Try-On", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
